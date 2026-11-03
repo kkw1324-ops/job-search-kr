@@ -1,0 +1,17 @@
+{
+  "description": "job-search-kr: 지원 서류 파일을 쓰기 전에 「쓰기 전 확인」과 검토 단계를 알린다. 막지 않는다.",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Write|Edit|apply_patch",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/skills/job-search-kr/scripts/doc_write_check.py\"",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -1,0 +1,11 @@
+{
+  "name": "job-search-kr",
+  "owner": { "name": "kkw1324-ops" },
+  "plugins": [
+    {
+      "name": "job-search-kr",
+      "source": "./plugins/job-search-kr",
+      "description": "한국 구직 도우미: 프로필 정리, 직군 추천, 공고 평가, 기업·직무 분석, 국문·영문 서류 작성과 검토, 면접·연봉 협상, 지원 기록."
+    }
+  ]
+}
