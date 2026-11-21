@@ -1,5 +1,5 @@
 {
-  "description": "job-search-kr: 지원 서류 파일을 쓰기 전에 「쓰기 전 확인」과 검토 단계를 알린다. 막지 않는다.",
+  "description": "job-search-kr: 지원 서류 저장 가드(작성기록 확인, 초안은 job-writer만 저장)와 위임 작업자에게 읽을 절차 알리기.",
   "hooks": {
     "PreToolUse": [
       {
@@ -8,6 +8,17 @@
           {
             "type": "command",
             "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/skills/job-search-kr/scripts/doc_write_check.py\"",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "SubagentStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/skills/job-search-kr/scripts/subagent_start.py\"",
             "timeout": 10
           }
         ]

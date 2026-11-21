@@ -15,10 +15,10 @@ class CheckTest(unittest.TestCase):
         self.assertEqual(ratio, 0)
 
     def test_lost_and_added_numbers(self):
-        _, issues = rc.check("고객 문의가 약 50% 줄었습니다.", "고객 문의가 60% 줄었습니다.")
+        _, issues = rc.check("반품이 약 30% 줄었습니다.", "반품이 40% 줄었습니다.")
         joined = "\n".join(issues)
-        self.assertIn("빠진 수치: 50%", joined)
-        self.assertIn("새 수치: 60%", joined)
+        self.assertIn("빠진 수치: 30%", joined)
+        self.assertIn("새 수치: 40%", joined)
 
     def test_hedge_removed(self):
         _, issues = rc.check("처리 시간이 약 62% 줄었습니다.", "처리 시간이 62% 줄었습니다.")
@@ -29,11 +29,11 @@ class CheckTest(unittest.TestCase):
         self.assertTrue(any("가능" in i for i in issues))
 
     def test_negation_removed(self):
-        _, issues = rc.check("모든 배송 지연은 막지 못했습니다.", "모든 배송 지연을 막았습니다.")
+        _, issues = rc.check("배송 지연은 막지 못했습니다.", "배송 지연을 막았습니다.")
         self.assertTrue(any("부정" in i for i in issues))
 
     def test_new_causal_link(self):
-        _, issues = rc.check("기준을 정했습니다. 문의가 줄었습니다.", "기준을 정했기 때문에 문의가 줄었습니다.")
+        _, issues = rc.check("기준을 정했습니다. 반품이 줄었습니다.", "기준을 정했기 때문에 반품이 줄었습니다.")
         self.assertTrue(any("인과 표현 늘어남" in i for i in issues))
 
     def test_large_rewrite_flagged(self):

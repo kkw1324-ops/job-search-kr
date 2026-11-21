@@ -21,7 +21,12 @@ class LinkTest(unittest.TestCase):
             for t in LINK.findall(md.read_text(encoding="utf-8")):
                 if t.startswith("http"):
                     continue
-                self.assertTrue((md.parent / t).is_file(), f"{md.name} -> {t}")
+                target = md.parent / t
+                if t.rsplit("/", 2)[-2:-1] == ["agents"] and not target.is_file():
+                    # Agent files live in .claude/agents (installed) or next to the skill copy (rewrite folder).
+                    name = t.rsplit("/", 1)[-1]
+                    target = next((c for c in (ROOT.parent.parent / "agents" / name, ROOT.parent / "agents" / name) if c.is_file()), target)
+                self.assertTrue(target.is_file(), f"{md.name} -> {t}")
 
     def test_evaluate_points_to_dropped_files(self):
         text = (REF / "evaluate.md").read_text(encoding="utf-8")
@@ -34,9 +39,26 @@ class LinkTest(unittest.TestCase):
         self.assertIn("탈락 패턴 분석", analysis)
         self.assertIn("부족한 역량과 학습 계획", analysis)
 
-    def test_skill_md_routes_first_start_file(self):
-        self.assertIn("references/first-start.md", (ROOT / "SKILL.md").read_text(encoding="utf-8"))
-        self.assertTrue((REF / "first-start.md").is_file())
+    def test_skill_md_holds_process_table_and_setup(self):
+        text = (ROOT / "SKILL.md").read_text(encoding="utf-8")
+        for heading in ("## 공정표", "## 진입 판정", "## 서류 문구의 필수 과정", "## 생략과 시간 부족", "## 보고 형식", "## 초기 설정"):
+            self.assertIn(heading, text, heading)
+        for n in range(1, 18):
+            self.assertRegex(text, rf"\n\| {n} \| ", f"공정 {n}")
+        self.assertNotIn("first-start", text)
+        self.assertFalse((REF / "first-start.md").exists())
+
+    def test_writing_log_template_matches_guard(self):
+        import sys
+        sys.path.insert(0, str(ROOT / "scripts"))
+        import doc_write_check as guard
+        template = (REF / "writing-log.md").read_text(encoding="utf-8")
+        self.assertIn("](references/writing-log.md)", (ROOT / "SKILL.md").read_text(encoding="utf-8"))
+        for step in ("① 지원 가능 확인", "④ 칸 설계", "⑩ 제출 준비", "## 사용자 통과"):
+            self.assertIn(step, template, step)
+        rows = guard.parse_log(template)
+        self.assertIsNotNone(rows, "template header must match the guard's HEADER")
+        self.assertEqual("".join(sorted(rows)), "".join(sorted(guard.STEPS)))
 
 
 if __name__ == "__main__":

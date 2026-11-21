@@ -4,7 +4,8 @@
   company_lookup.py check  → 키와 연결만 확인한다. 회사명은 보내지 않는다.
   company_lookup.py run    → work/company-query.json 을 읽어 조회하고
                              work/회사/<폴더>/공공자료.md 와 공공자료.json 에 쓴다.
-                             후보가 여럿이면 work/company-candidates.md 를 쓰고 멈춘다.
+                             후보가 여럿이면(이름이 정확히 같은 회사가 하나라도 비슷한 이름이
+                             함께 나오면) work/company-candidates.md 를 쓰고 멈춘다.
 
 인자는 check / run 하나만 받는다. 키는 환경 변수나 키 파일(~/.config/job-search-kr/.env)에서 이 스크립트만 읽고, 화면과 파일에 쓰지 않는다.
 요청마다 먼저 공식 주소인지 검사하고, 인증서를 확인한 연결로만 보내며, 다른 주소로 넘기는 응답은 따르지 않는다.
@@ -17,6 +18,7 @@ import re
 import socket
 import ssl
 import sys
+import time
 import unicodedata
 import urllib.error
 import urllib.parse
@@ -40,12 +42,16 @@ DART_LIST = CACHE / "dart-corpcode.json"
 DART_LIST_DAYS = 30
 POSTINGS = ROOT / "postings"
 
-TIMEOUT = 10
+TIMEOUT = 30
+RETRY_WAIT = 3  # 연결 실패 뒤 한 번 다시 호출하기 전에 기다리는 초
+NPS_TIMEOUT = 60  # 국민연금 응답은 10초를 자주 넘는다
+NPS_SITES = 5  # 가입자를 합산할 등록 사업장 수
+NPS_PAGES = 10  # 이름 검색은 사업장 하나가 달마다 한 줄씩 나와 흔한 이름은 첫 페이지에 다 안 든다
 MAX_BODY = 5 * 1024 * 1024
 MAX_ZIP = 30 * 1024 * 1024
 MAX_JOBS = 30 * 1024 * 1024  # 공고가 수백 건인 회사는 본문까지 합쳐 수 MB가 넘는다
 MAX_UNZIPPED = 150 * 1024 * 1024
-MAX_CALLS = 80
+MAX_CALLS = 200
 MAX_CANDIDATES = 12
 
 KEY_FILE = Path.home() / ".config" / "job-search-kr" / ".env"
@@ -251,10 +257,16 @@ def request(url, params=None, data=None, limit=MAX_BODY, timeout=TIMEOUT):
     check_url(url)
     full = url + ("?" + urllib.parse.urlencode(params) if params else "")
     check_url(full)
-    if _calls >= MAX_CALLS:
-        raise SourceError(LIMIT, f"한 번 실행의 호출 상한 {MAX_CALLS}건에 닿았습니다")
-    _calls += 1
-    return fetch(full, data=data, limit=limit, timeout=timeout)
+    for attempt in range(2):
+        if _calls >= MAX_CALLS:
+            raise SourceError(LIMIT, f"한 번 실행의 호출 상한 {MAX_CALLS}건에 닿았습니다")
+        _calls += 1
+        try:
+            return fetch(full, data=data, limit=limit, timeout=timeout)
+        except SourceError as exc:
+            if exc.kind != CONN or attempt:
+                raise
+        time.sleep(RETRY_WAIT)
 
 
 def tls_check(host):
@@ -597,12 +609,19 @@ def search_fsc(name, key, log):
 def search_nps(name, key, log):
     """이름으로 국민연금 사업장을 찾는다. 이름이 들어간 곳을 모두 찾고, 한 사업장이 달마다 한 줄씩 나온다(식별번호도 달마다 다르다).
     찾기만으로는 성공으로 적지 않는다. 맞는 사업장의 자료를 받았을 때 성공으로 적는다."""
-    params = {"serviceKey": key, "wkplNm": name, "pageNo": 1, "numOfRows": 100, "dataType": "json"}
-    try:
-        items = parse_dg(request(NPS + "/getBassInfoSearchV2", params))
-    except SourceError as exc:
-        log.fail("국민연금", exc)
-        return []
+    items = []
+    for page in range(1, NPS_PAGES + 1):
+        params = {"serviceKey": key, "wkplNm": name, "pageNo": page, "numOfRows": 100, "dataType": "json"}
+        try:
+            got = parse_dg(request(NPS + "/getBassInfoSearchV2", params, timeout=NPS_TIMEOUT))
+        except SourceError as exc:
+            log.fail("국민연금", exc)
+            break
+        items += got
+        if len(got) < 100:
+            break
+    else:
+        log.fail("국민연금", SourceError(NO_DATA, f"이름 검색이 {NPS_PAGES}페이지 상한에 닿아 일부 사업장·달이 빠졌을 수 있습니다"))
     return [nps_workplace(i) for i in items if i.get("seq")]
 
 
@@ -625,18 +644,18 @@ def nps_names(names):
     for n in list(out):
         base = re.sub(r"\(주\)|㈜|주식회사", "", n).strip()
         if base:
-            out += [f"{base} 주식회사", f"주식회사 {base}", f"(주){base}", f"{base}(주)", base]
+            out += [base, f"{base} 주식회사", f"주식회사 {base}", f"(주){base}", f"{base}(주)"]
     return list(dict.fromkeys(out))
 
 
 def find_workplaces(names, key, log, prefix="", target="", tries=4):
-    """이름을 바꿔 가며 찾다가 맞는 사업장이 나오면 멈춘다. 사업자등록번호 앞 6자리가 있으면 그것으로, 없으면 이름으로 맞춘다."""
+    """이름 표기마다 나오는 사업장과 달이 달라 모든 표기를 찾아 합친다. 사업자등록번호 앞 6자리가 있으면 그것으로, 없으면 이름으로 맞춘다."""
+    rows = {}
     for name in nps_names(names)[:tries]:
-        groups = group_workplaces(search_nps(name, key, log))
-        mine = [g for g in groups if (g["앞6자리"] == prefix if prefix else norm_name(g["이름"]) == target)]
-        if mine:
-            return mine
-    return []
+        rows.update((w["seq"], w) for w in search_nps(name, key, log))
+        if any(k == "fail" and e.kind == CONN for k, e in log.events["국민연금"]):
+            break  # 재시도까지 실패한 장애에서는 표기마다 기다리지 않는다
+    return [g for g in group_workplaces(list(rows.values())) if (g["앞6자리"] == prefix if prefix else norm_name(g["이름"]) == target)]
 
 
 def find_candidates(name, keys, today, log):
@@ -662,7 +681,7 @@ def write_candidates(name, cands, today, total):
     more = f" 찾은 {total}곳 중 {len(cands)}곳만 적었습니다. 없으면 정식 회사명이나 사업자등록번호로 다시 찾습니다." if total > len(cands) else ""
     lines = [
         f"# {md(name)} 후보", f"조회일: {today}", "",
-        "이름이 같은 회사가 여럿이거나 비슷한 이름만 찾았습니다. 사용자가 번호를 고르면 요청 파일의 후보번호에 넣고 다시 실행합니다." + more, "",
+        "이름이 같은 회사가 여럿이거나, 비슷한 이름의 회사가 함께 나왔습니다(이름이 정확히 같은 회사가 1번이어도 공고의 회사와 대표자·소재지·업종을 맞춰 봅니다). 사용자가 번호를 고르면 요청 파일의 후보번호에 넣고 다시 실행합니다." + more, "",
         "| 번호 | 이름 | 대표자 | 소재지 | 설립일 | 상장 | 찾은 곳 |", "|---|---|---|---|---|---|---|",
     ]
     for i, c in enumerate(cands, 1):
@@ -697,8 +716,10 @@ def resolve(q, keys, today, log):
         if match:
             return match[0], "ok"
         return {"이름": q["회사명"], "사업자등록번호": q["사업자등록번호"], "찾은곳": ["요청 파일"]}, "ok"
+    # 이름이 정확히 같은 회사가 하나여도 비슷한 이름의 다른 회사가 함께 나오면 멈춘다.
+    # 공고가 줄인 이름이나 브랜드명을 썼으면 이름이 같은 회사가 오히려 다른 회사일 수 있다.
     exact = [c for c in cands if norm_name(c.get("이름")) == norm_name(q["회사명"])]
-    if len(exact) == 1:
+    if len(exact) == 1 and len(cands) == 1:
         return exact[0], "ok"
     if not cands:
         return None, "none"
@@ -718,6 +739,25 @@ def dart_year_rows(key, code, api, today, label):
             if exc.kind != NO_DATA:
                 raise
     raise SourceError(NO_DATA, f"{label} 없음(최근 2개 연도 사업보고서가 없는 회사)")
+
+
+def dart_audit_reports(key, code, today):
+    """사업보고서가 없는 외부감사 대상 회사의 감사보고서 목록(최근 10년, 최근 것부터 10건)을 돌려준다.
+    비상장 외국계·중견 회사의 매출은 여기서만 나오는 경우가 많다. 본문은 메인 대화가 주소를 열어 읽는다."""
+    params = {"crtfc_key": key, "corp_code": code, "bgn_de": f"{today.year - 10}0101", "end_de": today.strftime("%Y%m%d"),
+              "pblntf_ty": "F", "page_count": 100}
+    try:
+        rows = parse_dart(request(f"{DART}/list.json", params)).get("list") or []
+    except SourceError as exc:
+        if exc.kind == NO_DATA:
+            return []
+        raise
+    out = []
+    for r in rows:
+        name, no = clean_text(r.get("report_nm", "")), digits(r.get("rcept_no"))
+        if "감사보고서" in name and no:
+            out.append({"보고서": name, "접수일": ymd(r.get("rcept_dt")), "주소": f"https://dart.fss.or.kr/dsaf001/main.do?rcpNo={no}"})
+    return sorted(out, key=lambda x: x["접수일"], reverse=True)[:10]
 
 
 ACCOUNTS = {
@@ -842,14 +882,14 @@ def salary_estimate(notice, members, yyyymm):
 
 
 def nps_detail(key, seq):
-    items = parse_dg(request(NPS + "/getDetailInfoSearchV2", {"serviceKey": key, "seq": seq, "dataType": "json"}))
+    items = parse_dg(request(NPS + "/getDetailInfoSearchV2", {"serviceKey": key, "seq": seq, "dataType": "json"}, timeout=NPS_TIMEOUT))
     if not items:
         raise SourceError(NO_DATA, "")
     return items[0]
 
 
 def nps_period(key, seq, ym):
-    items = parse_dg(request(NPS + "/getPdAcctoSttusInfoSearchV2", {"serviceKey": key, "seq": seq, "dataCrtYm": ym, "dataType": "json"}))
+    items = parse_dg(request(NPS + "/getPdAcctoSttusInfoSearchV2", {"serviceKey": key, "seq": seq, "dataCrtYm": ym, "dataType": "json"}, timeout=NPS_TIMEOUT))
     if not items:
         raise SourceError(NO_DATA, "")
     return items[0]
@@ -858,7 +898,8 @@ def nps_period(key, seq, ym):
 def collect_nps(key, groups, log):
     """사업장마다 최근 달의 가입자·고지금액을 받고, 가입자가 가장 많은 사업장은 12개월의 가입자·입사·퇴사를 받는다.
     달마다 식별번호가 달라 그 달의 식별번호로 그 달 자료를 조회한다."""
-    live = [g for g in groups if g.get("상태") == "등록"][:5] or groups[:1]
+    registered = sorted((g for g in groups if g.get("상태") == "등록"), key=lambda g: -len(g["달별"]))
+    live = registered[:NPS_SITES] or groups[:1]
     details = []
     for g in live:
         latest = g["달별"][0]
@@ -869,6 +910,8 @@ def collect_nps(key, groups, log):
                             "업종": short(it.get("vldtVlKrnNm"), 60), "달별": g["달별"]})
     if not details:
         return None
+    if len(registered) > NPS_SITES:
+        log.ok("국민연금", f"등록 사업장 {len(registered)}곳 중 달별 자료가 많은 {NPS_SITES}곳만 합산")
     main = max(details, key=lambda d: d["가입자수"] or 0)
     monthly = []
     for i, m in enumerate(main["달별"]):
@@ -1084,6 +1127,11 @@ def build_markdown(r):
         out += ["", "업종 평균과 판정(O·△·X)은 기업 분석 단계에서 찾아 붙인다."]
     else:
         out.append("- 재무 자료 없음(조회 상태 참고)")
+    if r.get("감사보고서"):
+        out += ["", "### DART 감사보고서 목록", "",
+                "사업보고서가 없어 오픈다트 주요 계정이 비는 회사다. 최근 감사보고서를 열어 재무제표의 매출·영업이익·자산·부채·자본을 읽는다(lookup.md 「조회 순서」 3).", "",
+                "| 접수일 | 보고서 | 주소 |", "|---|---|---|"]
+        out += [f"| {a['접수일']} | {md(a['보고서'])} | {a['주소']} |" for a in r["감사보고서"]]
     if r.get("공고"):
         korea = sum(1 for j in r["공고"] if KOREA.search(j["근무지"]))
         out += ["", "## 열린 공고", "", f"열린 공고 {len(r['공고'])}건, 그중 한국 근무 {korea}건. 한국 근무를 먼저 적었다.", "",
@@ -1125,6 +1173,13 @@ def load_query():
     return q
 
 
+def keep_previous(*paths):
+    """다시 조회한 결과가 더 나쁠 때 되돌릴 수 있게 이전 결과를 「-이전」 이름으로 남긴다."""
+    for path in paths:
+        if path.is_file() and not path.is_symlink():
+            os.replace(path, path.with_name(f"{path.stem}-이전{path.suffix}"))
+
+
 def run():
     q = load_query()
     today = datetime.now(KST).date()
@@ -1157,7 +1212,7 @@ def run():
 
     sources_used = []
     ident = {k: company.get(k, "") for k in ("이름", "대표자", "법인등록번호", "사업자등록번호", "오픈다트코드", "설립일", "주소", "홈페이지", "상장")}
-    staff, fin, nts = {}, None, None
+    staff, fin, nts, audits = {}, None, None, []
     crno, bzno, dart_code = ident["법인등록번호"], ident["사업자등록번호"] or q["사업자등록번호"], ident["오픈다트코드"]
 
     if keys["dart"] and dart_code:
@@ -1180,6 +1235,10 @@ def run():
             fin = dart_financials(acc[1], acc[0])
             if fin:
                 sources_used.append(f"오픈다트 단일회사 주요계정 API, {acc[0]} 사업보고서")
+        if not fin:
+            audits = log.attempt("오픈다트", dart_audit_reports, keys["dart"], dart_code, today) or []
+            if audits:
+                sources_used.append("오픈다트 공시검색 API(외부감사관련)")
     elif keys["dart"] and not log.events["오픈다트"]:
         log.skip("오픈다트", "오픈다트에 공시 회사로 없음")
 
@@ -1250,12 +1309,13 @@ def run():
     result = {
         "조회일": str(today), "요청": {"회사명": q["회사명"], "폴더": q["폴더"]}, "식별": ident,
         "조회 상태": {s: log.summary(s) for s in SOURCES if s not in ("그린하우스", "레버") or q[s]},
-        "사업자 상태": nts, "직원": {k: v for k, v in staff.items() if v}, "재무": fin,
+        "사업자 상태": nts, "직원": {k: v for k, v in staff.items() if v}, "재무": fin, "감사보고서": audits,
         "지표": indicators(fin) if fin else {}, "공고": jobs, "저장한 공고": str(saved) if saved else "",
         "출처": list(dict.fromkeys(sources_used)),
     }
     target = output_dir(q["폴더"], WORK / "회사")
     md_path, json_path = target / "공공자료.md", target / "공공자료.json"
+    keep_previous(md_path, json_path)
     with atomic_write(md_path) as tmp:
         tmp.write_text(scrub(build_markdown(result)), encoding="utf-8")
     serial = {**result, "지표": {k: {"값": v, "메모": n} for k, (v, n) in result["지표"].items()}}
@@ -1282,7 +1342,7 @@ def check():
     tests = [
         ("금융위원회 기업기본정보", "data", lambda k: parse_dg(request(FSC_OUTLINE, {"ServiceKey": k, "pageNo": 1, "numOfRows": 1, "resultType": "json"}))),
         ("금융위원회 재무정보", "data", lambda k: parse_dg(request(FSC_SUMMARY, {"serviceKey": k, "pageNo": 1, "numOfRows": 1, "resultType": "json"}))),
-        ("국민연금", "data", lambda k: parse_dg(request(NPS + "/getBassInfoSearchV2", {"serviceKey": k, "wkplNm": "국민연금공단", "pageNo": 1, "numOfRows": 1, "dataType": "json"}))),
+        ("국민연금", "data", lambda k: parse_dg(request(NPS + "/getBassInfoSearchV2", {"serviceKey": k, "wkplNm": "국민연금공단", "pageNo": 1, "numOfRows": 1, "dataType": "json"}, timeout=NPS_TIMEOUT))),
         ("근로복지공단", "data", lambda k: parse_dg(request(COMWEL, {"serviceKey": k, "pageNo": 1, "numOfRows": 1, "opaBoheomFg": "2"}))),
         ("국세청", "data", lambda k: collect_nts(k, "0000000000")),
         ("오픈다트", "dart", lambda k: parse_dart(request(DART + "/company.json", {"crtfc_key": k, "corp_code": "00126380"}))),

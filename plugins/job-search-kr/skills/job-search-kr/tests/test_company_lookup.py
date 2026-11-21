@@ -67,6 +67,11 @@ class FakeNet:
                     "00000002": ("가나다", "1101110000002", "2234567890", "E")}.get(code, ("가나다(주)", "1101110000001", "1234567890", "E"))
             return json.dumps({"status": "000", "corp_name": info[0], "ceo_nm": "홍길동", "jurir_no": info[1], "bizr_no": info[2],
                                "adres": "서울특별시 강남구 테헤란로 1", "est_dt": "20100101", "corp_cls": info[3], "induty_code": "620"}).encode()
+        if path == "/api/list.json":
+            return json.dumps({"status": "000", "list": [
+                {"report_nm": "감사보고서 (2024.12)", "rcept_no": "20250401000111", "rcept_dt": "20250401"},
+                {"report_nm": "감사보고서 (2025.12)", "rcept_no": "20260401000222", "rcept_dt": "20260401"},
+                {"report_nm": "기타 외부감사 관련 보고", "rcept_no": "20260501000333", "rcept_dt": "20260501"}]}).encode()
         if path == "/api/empSttus.json":
             return json.dumps({"status": "013", "message": "조회된 데이타가 없습니다."}).encode()
         if path == "/api/fnlttSinglAcnt.json":
@@ -295,6 +300,200 @@ class ParseTest(unittest.TestCase):
         text = cl.html_to_text("&lt;p&gt;Hello&lt;/p&gt;&lt;ul&gt;&lt;li&gt;A&lt;/li&gt;&lt;/ul&gt;&lt;script&gt;x()&lt;/script&gt;")
         self.assertEqual(text, "Hello\n\n- A")
 
+    def test_nps_search_reads_later_pages(self):
+        def page(n, count):
+            return [{"seq": f"{n}-{i}", "wkplNm": "가나다", "wkplJnngStcd": "1"} for i in range(count)]
+        pages = {1: page(1, 100), 2: page(2, 100), 3: page(3, 7)}
+        seen = []
+
+        def fake_request(url, params, timeout=cl.TIMEOUT):
+            seen.append((params["pageNo"], timeout))
+            return dg_json(pages[params["pageNo"]])
+        with mock.patch.object(cl, "request", side_effect=fake_request):
+            found = cl.search_nps("가나다", DATA_KEY, cl.Log())
+        self.assertEqual(len(found), 207)
+        self.assertEqual([p for p, _ in seen], [1, 2, 3])
+        self.assertTrue(all(t == cl.NPS_TIMEOUT for _, t in seen))
+
+    def test_nps_search_stops_at_page_cap(self):
+        full = [{"seq": "x", "wkplNm": "가나다", "wkplJnngStcd": "1"}] * 100
+        with mock.patch.object(cl, "request", return_value=dg_json(full)) as req:
+            cl.search_nps("가나다", DATA_KEY, cl.Log())
+        self.assertEqual(req.call_count, cl.NPS_PAGES)
+
+    def _check_timeouts(self):
+        """check()가 주소별로 어떤 시간 제한을 넘겼는지 돌려준다."""
+        seen = {}
+
+        def fake_request(url, params=None, data=None, limit=cl.MAX_BODY, timeout=cl.TIMEOUT):
+            seen[url] = timeout
+            return dg_json([])
+        keys = {"data": (DATA_KEY, ""), "dart": (DART_KEY, "")}
+        with mock.patch.object(cl, "request", side_effect=fake_request), \
+                mock.patch.object(cl, "tls_check", return_value=(True, "")), \
+                mock.patch.object(cl, "read_key", side_effect=keys.get), \
+                mock.patch.object(cl, "parse_dart", return_value={}), \
+                mock.patch.object(cl, "collect_nts", return_value={}), \
+                contextlib.redirect_stdout(io.StringIO()):
+            cl.check()
+        return seen
+
+    def test_check_uses_nps_timeout_for_nps(self):
+        seen = self._check_timeouts()
+        nps = [t for url, t in seen.items() if url.startswith(cl.NPS)]
+        self.assertEqual(nps, [cl.NPS_TIMEOUT])
+
+    def test_check_keeps_default_timeout_for_other_sources(self):
+        seen = self._check_timeouts()
+        others = [t for url, t in seen.items() if not url.startswith(cl.NPS)]
+        self.assertTrue(others)
+        self.assertTrue(all(t == cl.TIMEOUT for t in others))
+
+    def _request_with(self, results, calls=0, **kwargs):
+        """fetch가 results를 차례로 내놓거나 던질 때 request를 돌린다. (값 또는 예외, fetch 목, sleep 목)."""
+        with mock.patch.object(cl, "fetch", side_effect=results) as net, \
+                mock.patch.object(cl.time, "sleep") as sleep, \
+                mock.patch.object(cl, "_calls", calls):
+            try:
+                out = cl.request(cl.DART + "/company.json", **kwargs)
+            except cl.SourceError as exc:
+                out = exc
+        return out, net, sleep
+
+    def test_default_timeout_is_30_seconds(self):
+        _, net, _ = self._request_with([b"{}"])
+        self.assertEqual(cl.TIMEOUT, 30)
+        self.assertEqual(net.call_args.kwargs["timeout"], 30)
+
+    def test_retry_once_after_connection_failure(self):
+        out, net, sleep = self._request_with([cl.SourceError(cl.CONN, "x"), b"ok"])
+        self.assertEqual(out, b"ok")
+        self.assertEqual(net.call_count, 2)
+        sleep.assert_called_once_with(cl.RETRY_WAIT)
+
+    def test_retry_failure_stays_connection_failure(self):
+        out, net, _ = self._request_with([cl.SourceError(cl.CONN, "x"), cl.SourceError(cl.CONN, "y")])
+        self.assertIsInstance(out, cl.SourceError)
+        self.assertEqual(out.kind, cl.CONN)
+        self.assertEqual(net.call_count, 2)
+
+    def test_other_failures_are_not_retried(self):
+        for kind in (cl.KEY_REJECTED, cl.NOT_APPROVED, cl.LIMIT, cl.NO_DATA, cl.BLOCKED, cl.BAD):
+            with self.subTest(kind=kind):
+                out, net, sleep = self._request_with([cl.SourceError(kind, "x"), b"ok"])
+                self.assertEqual(out.kind, kind)
+                self.assertEqual(net.call_count, 1)
+                sleep.assert_not_called()
+
+    def test_retry_keeps_the_caller_timeout(self):
+        _, net, _ = self._request_with([cl.SourceError(cl.CONN, "x"), b"ok"], timeout=cl.NPS_TIMEOUT)
+        self.assertEqual([c.kwargs["timeout"] for c in net.call_args_list], [cl.NPS_TIMEOUT, cl.NPS_TIMEOUT])
+
+    def test_retry_counts_toward_call_cap(self):
+        out, net, _ = self._request_with([cl.SourceError(cl.CONN, "x"), b"ok"], calls=cl.MAX_CALLS - 1)
+        self.assertEqual(out.kind, cl.LIMIT)
+        self.assertEqual(net.call_count, 1)
+
+    def _workplaces(self, by_name, names=("가나다 주식회사", "가나다"), **kwargs):
+        """표기별 검색 결과를 흉내 내 find_workplaces를 돌린다. (결과, search_nps 목)."""
+        def fake(name, key, log):
+            found = by_name.get(name, [])
+            if isinstance(found, Exception):
+                log.fail("국민연금", found)
+                return []
+            return found
+        with mock.patch.object(cl, "search_nps", side_effect=fake) as search:
+            out = cl.find_workplaces(list(names), DATA_KEY, cl.Log(), **kwargs)
+        return out, search
+
+    @staticmethod
+    def _row(seq, month, name="가나다(주)", prefix="123456", state="등록"):
+        return {"seq": seq, "이름": name, "주소": "경기", "앞6자리": prefix, "상태": state, "자료년월": month}
+
+    def test_workplaces_keep_searching_after_first_match(self):
+        site = self._row("s1", "202601", name="가나다(주)/현장", state="탈퇴")
+        head = self._row("h1", "202609")
+        out, search = self._workplaces({"가나다 주식회사": [site], "가나다": [head]}, prefix="123456")
+        self.assertEqual(search.call_count, 4)
+        self.assertEqual(sorted(g["이름"] for g in out), ["가나다(주)", "가나다(주)/현장"])
+
+    def test_workplaces_merge_months_across_spellings(self):
+        early = self._row("m1", "202607")
+        late = self._row("m2", "202608", name="주식회사 가나다")
+        out, _ = self._workplaces({"가나다 주식회사": [early], "가나다": [late]}, prefix="123456")
+        self.assertEqual(len(out), 1)
+        self.assertEqual([m["자료년월"] for m in out[0]["달별"]], ["202608", "202607"])
+
+    def test_workplaces_do_not_repeat_the_same_month(self):
+        row = self._row("m1", "202607")
+        out, _ = self._workplaces({"가나다 주식회사": [row], "가나다": [dict(row)]}, prefix="123456")
+        self.assertEqual(len(out[0]["달별"]), 1)
+
+    def test_workplaces_respect_the_spelling_cap(self):
+        _, search = self._workplaces({}, prefix="123456", tries=2)
+        self.assertEqual(search.call_count, 2)
+
+    def test_workplaces_exclude_other_business_numbers(self):
+        other = self._row("x1", "202609", prefix="999999")
+        out, _ = self._workplaces({"가나다": [other]}, prefix="123456")
+        self.assertEqual(out, [])
+
+    def test_workplaces_continue_after_an_empty_spelling(self):
+        head = self._row("h1", "202609")
+        empty = cl.SourceError(cl.NO_DATA, "")
+        out, _ = self._workplaces({"가나다 주식회사": empty, "가나다": [head]}, prefix="123456")
+        self.assertEqual([g["이름"] for g in out], ["가나다(주)"])
+
+    def test_workplaces_stop_after_a_connection_failure(self):
+        failed = cl.SourceError(cl.CONN, "x")
+        _, search = self._workplaces({"가나다 주식회사": failed}, prefix="123456")
+        self.assertEqual(search.call_count, 1)
+
+    def test_bare_name_is_within_the_spelling_cap(self):
+        self.assertEqual(cl.nps_names(["가나다(주)"])[:2], ["가나다(주)", "가나다"])
+
+    def test_page_cap_is_disclosed(self):
+        full = [{"seq": "x", "wkplNm": "가나다", "wkplJnngStcd": "1"}] * 100
+        log = cl.Log()
+        with mock.patch.object(cl, "request", return_value=dg_json(full)):
+            cl.search_nps("가나다", DATA_KEY, log)
+        log.ok("국민연금")
+        self.assertIn("상한", log.summary("국민연금"))
+
+    def _collect(self, groups):
+        detail = {"jnngpCnt": "10", "crrmmNtcAmt": "1000", "adptDt": "", "vldtVlKrnNm": ""}
+        log = cl.Log()
+        with mock.patch.object(cl, "nps_detail", return_value=detail), mock.patch.object(cl, "nps_period", return_value={}):
+            return cl.collect_nps(DATA_KEY, groups, log), log
+
+    @staticmethod
+    def _group(name, months):
+        return {"이름": name, "주소": "", "앞6자리": "123456", "상태": "등록",
+                "달별": [{"seq": f"{name}{i}", "자료년월": f"2026{i + 1:02d}"} for i in range(months)]}
+
+    def test_collect_prefers_sites_with_longer_history(self):
+        small = [self._group(f"현장{i}", 1) for i in range(5)]
+        out, _ = self._collect(small + [self._group("본사", 12)])
+        self.assertIn("본사", [d["이름"] for d in out["사업장"]])
+
+    def test_collect_discloses_omitted_sites(self):
+        _, log = self._collect([self._group(f"현장{i}", 1) for i in range(6)])
+        self.assertIn("6곳 중", log.summary("국민연금"))
+
+    def test_keep_previous_preserves_old_result(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "공공자료.json"
+            path.write_text("old", encoding="utf-8")
+            cl.keep_previous(path)
+            self.assertFalse(path.exists())
+            self.assertEqual((Path(d) / "공공자료-이전.json").read_text(encoding="utf-8"), "old")
+
+    def test_workplaces_match_by_name_without_prefix(self):
+        same = self._row("a1", "202609")
+        near = self._row("b1", "202609", name="가나다라")
+        out, _ = self._workplaces({"가나다": [same, near]}, target=cl.norm_name("가나다"))
+        self.assertEqual([g["이름"] for g in out], ["가나다(주)"])
+
     def test_names(self):
         self.assertEqual(cl.norm_name("(주)가나다"), cl.norm_name("가나다 주식회사"))
         self.assertEqual(cl.norm_name("㈜가나다"), cl.norm_name("가나다"))
@@ -366,6 +565,37 @@ class RunTest(Base):
         self.assertEqual(code, 0, out)
         md = (self.tmp / "work" / "회사" / "가나다" / "공공자료.md").read_text(encoding="utf-8")
         self.assertIn("법인등록번호: 1101110000002", md)
+
+    def test_audit_reports_listed_when_no_business_report(self):
+        # 사업보고서가 없는 외부감사 회사는 감사보고서 목록이 공공자료.md 에 실린다
+        net = FakeNet([("00000001", "가나다", "")])
+        with mock.patch.object(cl, "dart_year_rows", side_effect=cl.SourceError(cl.NO_DATA, "없음")), \
+                mock.patch.object(cl, "fsc_financials", return_value=None):
+            code, out = self.run_query({"회사명": "(주)가나다", "폴더": "가나다"}, net)
+        self.assertEqual(code, 0, out)
+        md = (self.tmp / "work" / "회사" / "가나다" / "공공자료.md").read_text(encoding="utf-8")
+        self.assertIn("### DART 감사보고서 목록", md)
+        self.assertLess(md.index("rcpNo=20260401000222"), md.index("rcpNo=20250401000111"))
+        self.assertNotIn("20260501000333", md)
+
+    def test_audit_reports_skipped_when_business_report_exists(self):
+        net = FakeNet([("00000001", "가나다", "")])
+        code, out = self.run_query({"회사명": "(주)가나다", "폴더": "가나다"}, net)
+        self.assertEqual(code, 0, out)
+        self.assertFalse(any("/api/list.json" in u for u, _ in net.calls))
+
+    def test_exact_name_with_similar_names_asks_user(self):
+        # 공고가 브랜드명(「가나다」)만 쓰면 이름이 정확히 같은 다른 회사가 골라질 수 있다
+        net = FakeNet([("00000001", "가나다(주)", "")])
+        similar = [{"이름": "가나다산업(주)", "대표자": "김", "법인등록번호": "1101119999999",
+                    "사업자등록번호": "9999999999", "주소": "어느도 어느시 1", "찾은곳": ["금융위원회"]}]
+        with mock.patch.object(cl, "search_fsc", return_value=similar), mock.patch.object(cl, "search_nps", return_value=[]):
+            code, out = self.run_query({"회사명": "가나다", "폴더": "가나다"}, net)
+        self.assertEqual(code, 3, out)
+        table = cl.CANDIDATES_MD.read_text(encoding="utf-8")
+        self.assertIn("| 1 | 가나다(주) |", table)
+        self.assertIn("가나다산업(주)", table)
+        self.assertFalse((self.tmp / "work" / "회사" / "가나다").exists())
 
     def test_missing_keys_still_fetch_job_board(self):
         jobs = json.dumps({"jobs": [{"id": 1, "title": "Engineer", "location": {"name": "Seoul, Korea"}, "departments": [],

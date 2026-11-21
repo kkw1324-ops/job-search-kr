@@ -1,0 +1,17 @@
+{
+  "description": "job-search-kr(Codex): 지원 서류 저장 가드(작성기록 확인). Codex에는 SubagentStart가 없어 위임 프롬프트에 읽을 파일을 직접 적는다.",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Write|Edit|apply_patch",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/skills/job-search-kr/scripts/doc_write_check.py\"",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}

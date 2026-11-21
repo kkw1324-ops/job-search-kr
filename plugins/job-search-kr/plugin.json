@@ -1,7 +1,7 @@
 {
   "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
   "name": "job-search-kr",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "한국 구직 도우미: 프로필 정리, 직군 추천, 공고 평가, 기업·직무 분석, 국문·영문 서류 작성과 검토, 면접·연봉 협상, 지원 기록.",
   "author": { "name": "kkw1324-ops" },
   "repository": "https://github.com/kkw1324-ops/job-search-kr",
@@ -9,7 +9,7 @@
   "keywords": ["job-search", "korean", "resume", "cover-letter", "interview"],
   "extensions": {
     "com.openai": {
-      "hooks": "./hooks/hooks.json",
+      "hooks": "./hooks/codex-hooks.json",
       "interface": {
         "displayName": "한국 구직 도우미",
         "shortDescription": "직군 추천부터 서류·면접·연봉 협상까지",
